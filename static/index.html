@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex History · 本地会话浏览器</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/" aria-label="返回查询首页"><span class="brand-icon">⌘</span> Codex <span class="brand-light">History</span></a><span class="local-badge"><i></i> 本地 · 只读访问</span></header>
+  <main>
+    <div class="page-heading"><div><div class="eyebrow">YOUR CONVERSATIONS, WITH CONTEXT</div><h1>找回每一次思路。</h1><p>按项目和关键词，查找本机的 Codex 会话。</p></div><button id="refresh" class="button secondary">↻ 刷新记录</button></div>
+    <section class="filter-panel" aria-label="查询条件">
+      <form id="filters">
+        <div class="filter-grid">
+          <label>所属项目<select name="project" id="project"><option value="">全部项目</option></select></label>
+          <label>会话标题<input name="title" placeholder="输入标题关键词" autocomplete="off"></label>
+          <label class="content-field">聊天内容<input name="content" placeholder="搜索消息、代码或工具输出" autocomplete="off" maxlength="300"></label>
+          <label>时间依据<select name="time_field"><option value="updated_at">最后更新时间</option><option value="created_at">创建时间</option></select></label>
+          <label>开始日期<input type="date" name="start" aria-label="开始日期"></label>
+          <label>结束日期<input type="date" name="end" aria-label="结束日期"></label>
+          <label>归档状态<select name="archived"><option value="">全部状态</option><option value="0">未归档</option><option value="1">已归档</option></select></label>
+        </div>
+        <div class="filter-bottom"><label class="checkbox"><input type="checkbox" name="include_agents" value="1"> 包含子代理会话</label><div class="actions"><button type="reset" class="button ghost">重置</button><button type="submit" class="button primary">查询记录 <span>↗</span></button></div></div>
+      </form>
+    </section>
+    <div id="index-status" class="index-status" role="status"></div>
+    <section class="results-panel" aria-label="查询结果">
+      <div class="results-header"><div><h2>会话记录 <span id="total" class="count">—</span></h2><span id="result-hint" class="muted">按最近更新时间排序</span></div><label class="page-size">每页 <select id="page-size" aria-label="每页条数"><option>10</option><option selected>20</option><option>50</option><option>100</option></select> 条</label></div>
+      <div id="list-state" class="state-box" role="status">正在读取本机会话…</div>
+      <div class="table-scroll"><table id="results-table" hidden><thead><tr><th>会话</th><th>项目</th><th>创建时间 / 更新时间</th><th>状态</th><th><span class="sr-only">操作</span></th></tr></thead><tbody id="results"></tbody></table></div>
+      <nav id="pagination" class="pagination" aria-label="结果分页"><span id="page-info" class="muted"></span><div id="page-buttons"></div></nav>
+    </section>
+    <footer><span>所有数据保留在本机</span><span id="source-path" title="数据源目录"></span></footer>
+  </main>
+  <dialog id="detail-dialog" aria-labelledby="detail-title">
+    <div class="detail-shell">
+      <header class="detail-header"><div class="detail-title-row"><span class="eyebrow">CONVERSATION</span><button id="close-detail" class="icon-button" aria-label="关闭详情">✕</button></div><h2 id="detail-title">正在加载会话…</h2><div id="detail-meta" class="detail-meta"></div><div class="detail-toolbar"><label class="checkbox"><input type="checkbox" id="show-tools" checked> 显示工具与过程</label><button id="export" class="button secondary small">导出 Markdown</button></div></header>
+      <div id="conversation" class="conversation" tabindex="0"><div id="detail-state" class="state-box" role="status">正在读取完整内容…</div><div id="messages"></div><div id="detail-bottom" class="detail-bottom"><span id="loaded-count" class="muted"></span><button id="load-more" class="button secondary">加载更多</button><button id="load-all" class="button ghost">加载全部</button></div></div>
+    </div>
+  </dialog>
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>

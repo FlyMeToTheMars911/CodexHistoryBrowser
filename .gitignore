@@ -1,0 +1,12 @@
+work/
+__pycache__/
+*.pyc
+.venv/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.jsonl
+*.log
+.env
+.env.*
