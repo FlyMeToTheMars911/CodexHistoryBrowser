@@ -1,0 +1,2 @@
+# Python 3.14+ can use compression.zstd from its standard library instead.
+zstandard==0.25.0

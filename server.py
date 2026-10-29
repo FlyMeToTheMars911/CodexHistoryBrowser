@@ -1,9 +1,10 @@
-"""Local Codex history browser. Python 3.10+, no third-party dependencies."""
+"""Local Codex history browser. Python 3.10+, Zstandard support for compressed rollouts."""
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
 import hashlib
+import io
 import json
 import logging
 import os
@@ -24,6 +25,12 @@ MAX_DETAIL_PAGE = 100
 INDEX_INTERVAL_SECONDS = 30
 MAX_QUERY_CHARS = 300
 TRIGRAM_SIZE = 3
+HISTORY_ITEM_COLUMNS = frozenset(('thread_id', 'item_id', 'turn_id', 'rollout_ordinal',
+                                  'created_at_ms', 'item_type', 'item_json'))
+PROJECTION_COLUMNS = frozenset(('thread_id', 'next_rollout_byte_offset'))
+MISSING_HISTORY_MESSAGE = '此会话的本地正文不可用：结构化历史为空，原始会话文件也不存在。会话元数据仍可查询。'
+ZSTANDARD_SUFFIX = '.zst'
+ZSTANDARD_DEPENDENCY_MESSAGE = '读取 .jsonl.zst 历史需要 Zstandard 支持；请安装 requirements.txt 中的依赖，或使用已内置依赖的 EXE。'
 
 
 @contextmanager
@@ -35,6 +42,74 @@ def read_db(path):
         yield connection
     finally:
         connection.close()
+
+
+def table_columns(connection, table):
+    # The identifier comes exclusively from our fixed table names, never request input.
+    return {row['name'] for row in connection.execute('PRAGMA table_info("' + table + '")')}
+
+
+def discover_db(home, prefix, fallback):
+    candidates = []
+    for path in home.glob(prefix + '_*.sqlite'):
+        version = path.stem.removeprefix(prefix + '_')
+        if version.isdecimal():
+            candidates.append((int(version), path))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else home / fallback
+
+
+def file_signature(path):
+    try:
+        stat = path.stat()
+        return f'{stat.st_size}:{stat.st_mtime_ns}'
+    except FileNotFoundError:
+        return 'missing'
+    except OSError as error:
+        # iter_items will report an unreadable source for this thread without
+        # preventing other threads from synchronizing.
+        return 'unreadable:' + type(error).__name__
+
+
+def resolve_rollout_path(row):
+    path = Path(row.get('rollout_path') or '')
+    try:
+        if path.is_file():
+            return path
+        compressed = Path(str(path) + ZSTANDARD_SUFFIX)
+        if compressed.is_file():
+            return compressed
+    except OSError:
+        # Opening the source will report a per-thread permission failure.
+        pass
+    return path
+
+
+@contextmanager
+def open_rollout(path):
+    if path.suffix != ZSTANDARD_SUFFIX:
+        with path.open(encoding='utf-8') as file:
+            yield file
+        return
+    try:
+        from compression import zstd
+    except ImportError:
+        try:
+            import zstandard
+        except ImportError as error:
+            raise ValueError(ZSTANDARD_DEPENDENCY_MESSAGE) from error
+        try:
+            with path.open('rb') as raw:
+                with zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True) as stream:
+                    with io.TextIOWrapper(stream, encoding='utf-8') as file:
+                        yield file
+        except zstandard.ZstdError as error:
+            raise ValueError(f'会话压缩文件无法解压：{path}') from error
+    else:
+        try:
+            with zstd.open(path, mode='rt', encoding='utf-8') as file:
+                yield file
+        except zstd.ZstdError as error:
+            raise ValueError(f'会话压缩文件无法解压：{path}') from error
 
 
 def text_content(value):
@@ -68,10 +143,13 @@ def item_text(item):
 class HistoryStore:
     def __init__(self, codex_home, work_dir):
         self.home = Path(codex_home).expanduser().resolve()
-        self.state_path = self.home / 'state_5.sqlite'
-        self.history_path = self.home / 'thread_history_1.sqlite'
+        self.state_path = discover_db(self.home, 'state', 'state_5.sqlite')
+        self.history_path = discover_db(self.home, 'thread_history', 'thread_history_1.sqlite')
         if not self.state_path.is_file():
             raise ValueError(f'未找到任务数据库：{self.state_path}')
+        with read_db(self.state_path) as connection:
+            if not {'id', 'created_at', 'updated_at'}.issubset(table_columns(connection, 'threads')):
+                raise ValueError(f'任务数据库 threads 缺少必需字段，需适配当前 Codex 结构：{self.state_path.name}')
         # Only our own derived index is writable. Never alter Codex files.
         identity = hashlib.sha256(str(self.home).encode()).hexdigest()[:12]
         self.cache_path = Path(work_dir) / f'search-v2-{identity}.sqlite'
@@ -98,7 +176,14 @@ class HistoryStore:
                 END;
             ''')
         self.status_lock = threading.Lock()
-        self.status = dict(running=False, total=0, indexed=0, last_sync=None, error=None)
+        self.status = dict(running=False, total=0, indexed=0, last_sync=None, error=None,
+                           unavailable=0, warnings=[])
+        self.schema_warnings = []
+        self.unavailable = {}
+        self.inspect_history_schema()
+        LOG.info('Source schema state=%s history=%s structured_history=%s projection=%s',
+                 self.state_path.name, self.history_path.name, self.history_items_available,
+                 self.projection_available)
         self.wake = threading.Event()
         self.stop = threading.Event()
         self.worker = threading.Thread(target=self.sync_loop, name='content-index', daemon=True)
@@ -119,17 +204,42 @@ class HistoryStore:
 
     def get_status(self):
         with self.status_lock:
-            return {**self.status, 'codex_home': str(self.home)}
+            return {**self.status, 'codex_home': str(self.home),
+                    'schema': {'state': self.state_path.name, 'history': self.history_path.name,
+                               'structured_history': self.history_items_available,
+                               'projection': self.projection_available}}
+
+    def inspect_history_schema(self):
+        warnings = []
+        self.history_items_available = False
+        self.projection_available = False
+        if self.history_path.is_file():
+            with read_db(self.history_path) as connection:
+                self.history_items_available = HISTORY_ITEM_COLUMNS.issubset(table_columns(connection, 'thread_items'))
+                self.projection_available = PROJECTION_COLUMNS.issubset(table_columns(connection, 'thread_history_projection_state'))
+            if not self.history_items_available:
+                warnings.append('结构化历史表缺少必需字段，已改读原始会话文件。')
+            elif not self.projection_available:
+                warnings.append('历史投影表缺少必需字段，已改用文件变化检测增量更新。')
+        else:
+            warnings.append('未找到结构化历史数据库，已改读原始会话文件。')
+        if warnings != self.schema_warnings:
+            for warning in warnings:
+                LOG.warning('History schema database=%s message=%s', self.history_path.name, warning)
+        self.schema_warnings = warnings
+        self.set_status(warnings=list(warnings))
+        LOG.debug('Schema state=%s history=%s items=%s projection=%s', self.state_path.name,
+                  self.history_path.name, self.history_items_available, self.projection_available)
 
     def threads(self):
         with read_db(self.state_path) as connection:
             rows = [dict(row) for row in connection.execute('SELECT * FROM threads')]
-            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             projects = {}
-            if 'projects' in tables:
+            if {'id', 'name'}.issubset(table_columns(connection, 'projects')):
                 projects = {row['id']: row['name'] for row in connection.execute('SELECT id,name FROM projects')}
         for row in rows:
-            cwd = row.get('cwd', '').removeprefix('\\\\?\\').rstrip('\\/')
+            cwd = (row.get('cwd') or '').removeprefix('\\\\?\\').rstrip('\\/')
+            row['archived'] = row.get('archived') or 0
             project_id = row.get('project_id')
             project_name = projects.get(project_id)
             # Actual project association takes precedence; old records fall back to cwd.
@@ -146,7 +256,7 @@ class HistoryStore:
         raise KeyError('会话不存在或已被移除')
 
     def iter_items(self, row, after=-1, limit=None):
-        if self.history_path.is_file():
+        if self.history_items_available:
             with read_db(self.history_path) as connection:
                 exists = connection.execute('SELECT 1 FROM thread_items WHERE thread_id=? LIMIT 1', (row['id'],)).fetchone()
                 if exists:
@@ -167,12 +277,12 @@ class HistoryStore:
         yield from self.rollout_items(row, after, limit)
 
     def rollout_items(self, row, after, limit):
-        path = Path(row['rollout_path'])
+        path = resolve_rollout_path(row)
         if not path.is_file():
-            raise FileNotFoundError(f'会话原始文件不存在：{path}')
+            raise FileNotFoundError(MISSING_HISTORY_MESSAGE)
         # Prefer visible completed events if available; otherwise use response messages.
         has_events = False
-        with path.open(encoding='utf-8') as file:
+        with open_rollout(path) as file:
             for line in file:
                 try:
                     event = json.loads(line)
@@ -183,7 +293,7 @@ class HistoryStore:
                     break
         emitted = 0
         turn_id = 'legacy'
-        with path.open(encoding='utf-8') as file:
+        with open_rollout(path) as file:
             for line_number, line in enumerate(file):
                 try:
                     event = json.loads(line)
@@ -223,23 +333,36 @@ class HistoryStore:
 
     def sync_once(self):
         rows = self.threads()
+        self.inspect_history_schema()
         projections = {}
-        if self.history_path.is_file():
+        if self.projection_available:
             with read_db(self.history_path) as connection:
                 projections = {r['thread_id']: str(r['next_rollout_byte_offset']) for r in connection.execute('SELECT * FROM thread_history_projection_state')}
         with self.cache() as connection:
             known = {r['id']: r['fingerprint'] for r in connection.execute('SELECT id,fingerprint FROM documents')}
+        history_signature = file_signature(self.history_path) + ':' + file_signature(Path(str(self.history_path) + '-wal'))
         self.set_status(running=True, total=len(rows), indexed=0, error=None)
         failures = 0
+        unavailable = {}
         for position, row in enumerate(rows, 1):
             if self.stop.is_set():
                 return
-            fingerprint = f"v1:{row.get('updated_at_ms') or row['updated_at']}:{projections.get(row['id'], '')}"
+            rollout = resolve_rollout_path(row)
+            fingerprint = (f"v2:{self.state_path.name}:{self.history_path.name}:"
+                           f"{row.get('updated_at_ms') or row['updated_at']}:"
+                           f"{self.history_items_available}:{projections.get(row['id'], history_signature)}:"
+                           f"{rollout}:{file_signature(rollout)}")
             if known.get(row['id']) != fingerprint:
                 try:
                     body = '\n\n'.join(item_text(item['data']) for item in self.iter_items(row))
                     with self.cache() as connection:
                         connection.execute('INSERT INTO documents(id,fingerprint,body) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET fingerprint=excluded.fingerprint,body=excluded.body', (row['id'], fingerprint, body))
+                except FileNotFoundError:
+                    unavailable[row['id']] = fingerprint
+                    with self.cache() as connection:
+                        connection.execute('DELETE FROM documents WHERE id=?', (row['id'],))
+                    if row['id'] not in self.unavailable:
+                        LOG.warning('History unavailable thread=%s rollout=%s; metadata remains searchable', row['id'], rollout)
                 except (OSError, sqlite3.Error, ValueError):
                     failures += 1
                     LOG.exception('Index failed thread=%s', row['id'])
@@ -247,8 +370,13 @@ class HistoryStore:
         live = {row['id'] for row in rows}
         with self.cache() as connection:
             connection.executemany('DELETE FROM documents WHERE id=?', [(key,) for key in known.keys() - live])
-        self.set_status(running=False, last_sync=int(time.time()), error=f'{failures} 个会话索引失败，详见服务日志' if failures else None)
-        LOG.info('Index synchronized threads=%s failed=%s', len(rows), failures)
+        self.unavailable = unavailable
+        warnings = list(self.schema_warnings)
+        if unavailable:
+            warnings.append(f'{len(unavailable)} 个会话的本地正文不可用，仍可查询标题和项目；文件恢复后会自动重新索引。')
+        self.set_status(running=False, last_sync=int(time.time()), unavailable=len(unavailable), warnings=warnings,
+                        error=f'{failures} 个会话索引失败，详见服务日志' if failures else None)
+        LOG.info('Index synchronized threads=%s unavailable=%s failed=%s', len(rows), len(unavailable), failures)
 
     def sync_loop(self):
         while not self.stop.is_set():
@@ -304,7 +432,7 @@ class HistoryStore:
                 continue
             if params.get('archived', '') in ('0', '1') and bool(row['archived']) != (params['archived'] == '1'):
                 continue
-            if params.get('include_agents', '0') != '1' and (row.get('thread_source') == 'subagent' or 'subagent' in row.get('source', '')):
+            if params.get('include_agents', '0') != '1' and (row.get('thread_source') == 'subagent' or 'subagent' in (row.get('source') or '')):
                 continue
             value = row.get(date_field) or 0
             if start is not None and value < start or end is not None and value >= end:
@@ -312,7 +440,7 @@ class HistoryStore:
             if matches is not None and row['id'] not in matches:
                 continue
             results.append({key: row.get(key) for key in ('id', 'title', 'project_name', 'project_path', 'project_key', 'created_at', 'updated_at', 'archived', 'model', 'thread_source', 'preview')})
-            results[-1]['snippet'] = matches[row['id']] if matches is not None else row.get('preview', '')[:240]
+            results[-1]['snippet'] = matches[row['id']] if matches is not None else (row.get('preview') or '')[:240]
         results.sort(key=lambda row: (row.get(date_field) or 0, row['id']), reverse=True)
         total = len(results)
         pages = max(1, (total + size - 1) // size)
@@ -399,9 +527,12 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(400 if isinstance(error, ValueError) else 404, {'error': str(error).strip("'")})
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
+        except FileNotFoundError as error:
+            LOG.warning('History request unavailable route=%s thread=%s', route.path, params.get('id', ''))
+            self.respond(404, {'error': str(error)})
         except Exception:
             LOG.exception('Request failed route=%s', route.path)
-            self.respond(500, {'error': '读取记录失败，请查看 work/server.log'})
+            self.respond(500, {'error': '读取记录失败，请查看程序运行日志'})
 
 
 def main():

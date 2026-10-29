@@ -2,6 +2,7 @@
 const $ = selector => document.querySelector(selector);
 const form = $('#filters');
 const dialog = $('#detail-dialog');
+const HTTP_NOT_FOUND = 404;
 const state = {page: 1, pageSize: 20, query: null, listRequest: 0, detailVersion: 0, detail: null, items: [], cursor: -1, more: false, detailBusy: false, indexWasRunning: false};
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const formatTime = seconds => seconds ? new Date(seconds * 1000).toLocaleString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
@@ -10,7 +11,11 @@ const toolNames = {commandExecution:'命令执行',fileChange:'文件修改',rea
 async function api(path, params={}) {
   const response = await fetch(path + '?' + new URLSearchParams(params));
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || '请求失败');
+  if (!response.ok) {
+    const error=new Error(result.error || '请求失败');
+    error.status=response.status;
+    throw error;
+  }
   return result;
 }
 function notify(message) { $('#toast').textContent=message; $('#toast').hidden=false; clearTimeout(notify.timer); notify.timer=setTimeout(()=>$('#toast').hidden=true,3000); }
@@ -65,8 +70,15 @@ function markdown(text) {
 function currentParams() { const params=Object.fromEntries(new FormData(form));params.include_agents=form.elements.include_agents.checked?'1':'0';return params; }
 function updateStatus(status) {
   const element=$('#index-status');
+  const warnings=Array.isArray(status.warnings)?status.warnings.filter(Boolean):[];
+  const unavailable=Number(status.unavailable)||0;
   element.classList.toggle('ready',!status.running&&!status.error);
+  element.classList.toggle('error',Boolean(status.error));
   element.textContent=status.error || (status.running ? `正在更新内容索引 ${status.indexed} / ${status.total} · 更新期间内容查询可能尚未包含全部记录` : status.last_sync ? '内容索引已就绪 · 自动增量更新 · 内容按连续关键词匹配，日期范围含起止当天' : '正在准备内容索引…');
+  if(unavailable&&!warnings.length)warnings.push(`${unavailable} 个会话的正文暂不可用；仍可按标题和项目查找。`);
+  const warning=$('#source-warnings');
+  warning.hidden=!warnings.length;
+  warning.textContent=warnings.join('\n');
   $('#source-path').textContent=status.codex_home;
 }
 async function search(reset=false) {
@@ -132,8 +144,22 @@ async function loadDetail(all=false) {
       if(all&&state.more){$('#loaded-count').textContent+= ' · 正在加载全部…';await new Promise(resolve=>setTimeout(resolve,0));}
     }while(all&&state.more&&version===state.detailVersion);
     if(!state.items.length){$('#detail-state').hidden=false;$('#detail-state').textContent='此会话暂无消息记录。';}
-  }catch(error){if(version===state.detailVersion){$('#detail-state').hidden=false;$('#detail-state').className='state-box error';$('#detail-state').textContent=error.message;throw error;}}
-  finally{if(version===state.detailVersion){state.detailBusy=false;$('#load-more').disabled=false;$('#load-all').disabled=false;$('#export').disabled=false;}}
+  }catch(error){
+    if(version===state.detailVersion){
+      $('#detail-state').hidden=false;
+      const unavailable=error.status===HTTP_NOT_FOUND;
+      $('#detail-state').className='state-box '+(unavailable?'unavailable':'error');
+      $('#detail-state').textContent=error.message;
+      if(unavailable){
+        state.more=false;
+        $('#load-more').hidden=true;$('#load-all').hidden=true;
+        if(!state.items.length)$('#detail-title').textContent='会话正文暂不可用';
+        $('#loaded-count').textContent='正文不可用，可返回继续查询其他会话';
+      }
+      throw error;
+    }
+  }
+  finally{if(version===state.detailVersion){state.detailBusy=false;$('#load-more').disabled=false;$('#load-all').disabled=false;$('#export').disabled=!state.items.length;}}
 }
 async function openDetail(id) {
   state.detailVersion++;state.detail={id};state.items=[];state.cursor=-1;state.more=true;state.detailBusy=false;
@@ -148,7 +174,25 @@ $('#close-detail').addEventListener('click',closeDetail);
 dialog.addEventListener('click',event=>{if(event.target===dialog){const rect=dialog.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)closeDetail();}});
 $('#show-tools').addEventListener('change',event=>$('#messages').classList.toggle('hide-tools',!event.target.checked));
 $('#load-more').addEventListener('click',()=>loadDetail().catch(()=>{}));$('#load-all').addEventListener('click',()=>loadDetail(true).catch(()=>{}));
-$('#export').addEventListener('click',async()=>{const version=state.detailVersion;try{if(state.more)await loadDetail(true);if(version!==state.detailVersion||state.more)return;const text='# '+state.detail.title+'\n\n项目：'+state.detail.project_name+'\n\n会话 ID：'+state.detail.id+'\n\n'+state.items.map(item=>'## '+(item.item_type==='userMessage'?'用户':item.item_type==='agentMessage'?'Codex':toolNames[item.item_type]||item.item_type)+'\n\n'+textOf(item)).join('\n\n---\n\n');const link=document.createElement('a');link.href=URL.createObjectURL(new Blob(['\ufeff'+text],{type:'text/markdown;charset=utf-8'}));link.download=(state.detail.title.replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').slice(0,80)||'会话')+'.md';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);}catch(error){notify('导出失败：'+error.message);}});
+$('#export').addEventListener('click',async()=>{
+  const version=state.detailVersion;
+  try{
+    if(state.more)await loadDetail(true);
+    if(version!==state.detailVersion||state.more||!state.items.length)return;
+    const text='# '+state.detail.title+'\n\n项目：'+state.detail.project_name+'\n\n会话 ID：'+state.detail.id+'\n\n'+state.items.map(item=>'## '+(item.item_type==='userMessage'?'用户':item.item_type==='agentMessage'?'Codex':toolNames[item.item_type]||item.item_type)+'\n\n'+textOf(item)).join('\n\n---\n\n');
+    const filename=(state.detail.title.replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').slice(0,80)||'会话')+'.md';
+    const content='\ufeff'+text;
+    if(window.pywebview?.api?.export_markdown){
+      const result=await window.pywebview.api.export_markdown(filename,content);
+      if(result?.saved)notify('Markdown 已保存');
+      return;
+    }
+    const link=document.createElement('a');
+    link.href=URL.createObjectURL(new Blob([content],{type:'text/markdown;charset=utf-8'}));
+    link.download=filename;link.click();
+    setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+  }catch(error){notify('导出失败：'+error.message);}
+});
 form.addEventListener('submit',event=>{event.preventDefault();search(true);});form.addEventListener('reset',()=>setTimeout(()=>search(true),0));
 $('#page-size').addEventListener('change',event=>{state.pageSize=Number(event.target.value);search(true);});
 $('#page-buttons').addEventListener('click',event=>{const button=event.target.closest('[data-page]');if(!button||button.disabled)return;state.page=Number(button.dataset.page);search();$('.results-panel').scrollIntoView({behavior:'smooth',block:'start'});});
@@ -162,5 +206,6 @@ async function init(){
     const id=new URLSearchParams(location.hash.slice(1)).get('thread');if(id)openDetail(id);
   }catch(error){$('#list-state').className='state-box error';$('#list-state').textContent=error.message;}
 }
-setInterval(async()=>{try{const status=await api('/api/status');updateStatus(status);if(state.indexWasRunning&&!status.running&&state.query?.content)search();state.indexWasRunning=status.running;}catch(error){$('#index-status').textContent='无法连接本地服务，请确认启动窗口仍在运行。';}},4000);
+window.addEventListener('pywebviewready',()=>{$('#local-mode').textContent='桌面 · 本地只读';});
+setInterval(async()=>{try{const status=await api('/api/status');updateStatus(status);if(state.indexWasRunning&&!status.running&&state.query?.content)search();state.indexWasRunning=status.running;}catch(error){$('#index-status').classList.remove('ready');$('#index-status').classList.add('error');$('#index-status').textContent='无法连接本地服务，请重新打开工具或确认服务仍在运行。';}},4000);
 init();

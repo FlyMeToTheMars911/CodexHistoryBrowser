@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
 </head>
 <body>
-  <header class="topbar"><a class="brand" href="/" aria-label="返回查询首页"><span class="brand-icon">⌘</span> Codex <span class="brand-light">History</span></a><span class="local-badge"><i></i> 本地 · 只读访问</span></header>
+  <header class="topbar"><a class="brand" href="/" aria-label="返回查询首页"><span class="brand-icon">⌘</span> Codex <span class="brand-light">History</span></a><span class="local-badge"><i></i> <span id="local-mode">本地 · 只读访问</span></span></header>
   <main>
     <div class="page-heading"><div><div class="eyebrow">YOUR CONVERSATIONS, WITH CONTEXT</div><h1>找回每一次思路。</h1><p>按项目和关键词，查找本机的 Codex 会话。</p></div><button id="refresh" class="button secondary">↻ 刷新记录</button></div>
     <section class="filter-panel" aria-label="查询条件">
@@ -25,6 +25,7 @@
       </form>
     </section>
     <div id="index-status" class="index-status" role="status"></div>
+    <div id="source-warnings" class="source-warnings" role="status" hidden></div>
     <section class="results-panel" aria-label="查询结果">
       <div class="results-header"><div><h2>会话记录 <span id="total" class="count">—</span></h2><span id="result-hint" class="muted">按最近更新时间排序</span></div><label class="page-size">每页 <select id="page-size" aria-label="每页条数"><option>10</option><option selected>20</option><option>50</option><option>100</option></select> 条</label></div>
       <div id="list-state" class="state-box" role="status">正在读取本机会话…</div>
