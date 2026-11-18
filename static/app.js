@@ -3,6 +3,8 @@ const $ = selector => document.querySelector(selector);
 const form = $('#filters');
 const dialog = $('#detail-dialog');
 const HTTP_NOT_FOUND = 404;
+const MESSAGE_TYPES = {user: 'userMessage', agent: 'agentMessage'};
+const PROCESS_PHASES = new Set(['commentary', 'analysis']);
 const state = {page: 1, pageSize: 20, query: null, listRequest: 0, detailVersion: 0, detail: null, items: [], cursor: -1, more: false, detailBusy: false, indexWasRunning: false};
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const formatTime = seconds => seconds ? new Date(seconds * 1000).toLocaleString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
@@ -107,6 +109,9 @@ function contentText(content) {
   return '';
 }
 function textOf(item) { const d=item.data; if(item.item_type==='userMessage')return contentText(d.content);if(item.item_type==='agentMessage')return d.text||contentText(d.content);return ['command','aggregatedOutput','aggregated_output','stdout','stderr','text','summary','content','result','output','arguments','changes'].filter(key=>d[key]).map(key=>typeof d[key]==='string'?d[key]:JSON.stringify(d[key],null,2)).join('\n\n') || JSON.stringify(d,null,2); }
+function isProcessItem(item) {
+  return item.item_type!==MESSAGE_TYPES.user && (item.item_type!==MESSAGE_TYPES.agent || PROCESS_PHASES.has(item.data.phase || item.data.channel));
+}
 function renderItems(items) {
   let previous=state.items.length?state.items[state.items.length-1].turn_id:null;
   const fragment=document.createDocumentFragment();
@@ -125,6 +130,7 @@ function renderItems(items) {
       // Defer large output DOM allocation until the tool record is expanded.
       node.addEventListener('toggle',()=>{if(node.open&&!node.dataset.rendered){const pre=document.createElement('pre');pre.className='tool-output';pre.textContent=text;node.querySelector('.tool-body').append(pre);node.dataset.rendered='1';}}, {once:false});
     }
+    node.classList.toggle('process',isProcessItem(item));
     const raw=document.createElement('details');raw.className='raw-json';raw.innerHTML='<summary>原始数据</summary>';raw.addEventListener('toggle',()=>{if(raw.open&&!raw.dataset.rendered){const pre=document.createElement('pre');pre.textContent=JSON.stringify(d,null,2);raw.append(pre);raw.dataset.rendered='1';}});
     (node.querySelector('.tool-body')||node).append(raw);fragment.append(node);
   }
@@ -179,7 +185,8 @@ $('#export').addEventListener('click',async()=>{
   try{
     if(state.more)await loadDetail(true);
     if(version!==state.detailVersion||state.more||!state.items.length)return;
-    const text='# '+state.detail.title+'\n\n项目：'+state.detail.project_name+'\n\n会话 ID：'+state.detail.id+'\n\n'+state.items.map(item=>'## '+(item.item_type==='userMessage'?'用户':item.item_type==='agentMessage'?'Codex':toolNames[item.item_type]||item.item_type)+'\n\n'+textOf(item)).join('\n\n---\n\n');
+    const items=$('#show-tools').checked?state.items:state.items.filter(item=>!isProcessItem(item));
+    const text='# '+state.detail.title+'\n\n项目：'+state.detail.project_name+'\n\n会话 ID：'+state.detail.id+'\n\n'+items.map(item=>'## '+(item.item_type==='userMessage'?'用户':item.item_type==='agentMessage'?'Codex':toolNames[item.item_type]||item.item_type)+'\n\n'+textOf(item)).join('\n\n---\n\n');
     const filename=(state.detail.title.replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').slice(0,80)||'会话')+'.md';
     const content='\ufeff'+text;
     if(window.pywebview?.api?.export_markdown){
